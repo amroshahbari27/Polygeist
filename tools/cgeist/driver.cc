@@ -586,6 +586,21 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Record which language mode compiled this kernel (e.g. "-std=clc++2021"
+  // vs "-std=cl2.0"/unset) as a module attribute. Nothing in the MLIR
+  // itself distinguishes the two once parsing is done -- C++-only
+  // constructs like _TTL_Induc are fully resolved by Clang's Sema before
+  // any MLIR exists, so this information would otherwise be lost by this
+  // point. Downstream passes (TTLToEmitC's local-buffer-access lowering)
+  // read this to decide which of TTL.h's checked accessor families to
+  // reuse when emitting generated code.
+  {
+    bool isCpp = Standard.find("++") != std::string::npos;
+    module->getOperation()->setAttr(
+        "ttl.source_lang",
+        mlir::StringAttr::get(&context, isCpp ? "cpp" : "c"));
+  }
+
   auto convertGepInBounds = [](llvm::Module &llvmModule) {
     for (auto &F : llvmModule) {
       for (auto &BB : F) {
@@ -881,6 +896,8 @@ int main(int argc, char **argv) {
     }
     pm.addPass(mlir::createSymbolDCEPass());
 
+    pm.addPass(polygeist::createStripPolygeistAttrsPass());
+
 #ifdef POLYGEIST_ENABLE_POLYMER
     if (ClPolyhedralOpt) {
       pm.addPass(polygeist::createPolyhedralOptPass());
@@ -1172,7 +1189,6 @@ int main(int argc, char **argv) {
                         llvm::Attribute::NoUnwind, llvm::Attribute::WillReturn})
         F->addFnAttr(Attr);
       F->setOnlyAccessesInaccessibleMemory();
-      F->addRetAttr(llvm::Attribute::NoAlias);
       F->addRetAttr(llvm::Attribute::NoUndef);
       SmallVector<llvm::Value *> todo = {F};
       while (todo.size()) {
@@ -1190,7 +1206,6 @@ int main(int argc, char **argv) {
             continue;
           }
         if (auto CI = dyn_cast<llvm::CallInst>(cur)) {
-          CI->addRetAttr(llvm::Attribute::NoAlias);
           CI->addRetAttr(llvm::Attribute::NoUndef);
         }
       }

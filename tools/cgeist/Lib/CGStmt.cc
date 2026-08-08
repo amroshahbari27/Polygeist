@@ -13,6 +13,7 @@
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Diagnostics.h"
+#include "llvm/ADT/StringSwitch.h"
 
 #define DEBUG_TYPE "CGStmt"
 
@@ -158,13 +159,78 @@ bool MLIRScanner::isTrivialAffineLoop(clang::ForStmt *fors,
   return true;
 }
 
+static void emitTTLLoopError(clang::Preprocessor &PP,
+                             clang::SourceLocation location,
+                             const llvm::Twine &message) {
+  unsigned id = PP.getDiagnostics().getCustomDiagID(
+      clang::DiagnosticsEngine::Error, "TTL structured loop: %0");
+  PP.Diag(location, id) << message.str();
+}
+
+/// Return the rank encoded by an actual project TTL_LOOP_*D expansion.
+///
+/// Clang attributes nested macro arguments to the outermost expansion site,
+/// so source line/column alone is insufficient. The pinned macro caller chain
+/// identifies the family, while the generated physical counter name prevents
+/// an ordinary loop passed through a TTL_LOOP body argument from impersonating
+/// another DSL loop.
+static unsigned getTTLLoopRank(clang::ForStmt *fors,
+                               clang::Preprocessor &preprocessor) {
+  auto *declaration = llvm::dyn_cast_or_null<clang::DeclStmt>(fors->getInit());
+  if (!declaration || !declaration->isSingleDecl())
+    return 0;
+  auto *counter =
+      llvm::dyn_cast<clang::VarDecl>(declaration->getSingleDecl());
+  if (!counter)
+    return 0;
+  llvm::StringRef counterName = counter->getName();
+  if (!counterName.ends_with("_TTL_RAW_COUNTER") &&
+      !counterName.ends_with("_MUST_BE_DECLARED_BY_TTL_LOOP"))
+    return 0;
+
+  clang::SourceLocation forLocation = fors->getForLoc();
+  if (!forLocation.isMacroID())
+    return 0;
+  static const llvm::StringRef loopMacros[] = {
+      "TTL_LOOP_1D", "TTL_LOOP_2D", "TTL_LOOP_3D"};
+  llvm::StringRef macroName = findProjectTTLMacroExpansion(
+      preprocessor, forLocation, loopMacros);
+  return llvm::StringSwitch<unsigned>(macroName)
+      .Case("TTL_LOOP_1D", 1)
+      .Case("TTL_LOOP_2D", 2)
+      .Case("TTL_LOOP_3D", 3)
+      .Default(0);
+}
+
+static clang::SourceLocation
+getTTLExpansionSite(const clang::SourceManager &sourceManager,
+                    clang::SourceLocation location) {
+  return sourceManager.getExpansionLoc(location);
+}
+
 void MLIRScanner::buildAffineLoopImpl(
     clang::ForStmt *fors, mlir::Location loc, mlir::Value lb, mlir::Value ub,
-    const mlirclang::AffineLoopDescriptor &descr) {
+    const mlirclang::AffineLoopDescriptor &descr, const TTLLoopAttrs *attrs,
+    bool isTTLFrontendLoop) {
   auto affineOp = builder.create<affine::AffineForOp>(
       loc, lb, builder.getSymbolIdentityMap(), ub,
       builder.getSymbolIdentityMap(), descr.getStep(),
       /*iterArgs=*/std::nullopt);
+
+  if (isTTLFrontendLoop)
+    affineOp->setAttr("ttl.frontend_loop", builder.getUnitAttr());
+  if (attrs && !attrs->tileSizes.empty())
+    affineOp->setAttr("ttl.tile", builder.getI64ArrayAttr(attrs->tileSizes));
+  auto stringArray = [&](ArrayRef<std::string> names) {
+    SmallVector<StringRef> refs(names.begin(), names.end());
+    return builder.getStrArrayAttr(refs);
+  };
+  if (attrs && !attrs->promoteTensorNames.empty())
+    affineOp->setAttr("ttl.promote",
+                      stringArray(attrs->promoteTensorNames));
+  if (attrs && !attrs->doubleBufferTensorNames.empty())
+    affineOp->setAttr("ttl.double_buffer",
+                      stringArray(attrs->doubleBufferTensorNames));
 
   auto &reg = affineOp.getRegion();
 
@@ -205,10 +271,11 @@ void MLIRScanner::buildAffineLoopImpl(
 
 void MLIRScanner::buildAffineLoop(
     clang::ForStmt *fors, mlir::Location loc,
-    const mlirclang::AffineLoopDescriptor &descr) {
+    const mlirclang::AffineLoopDescriptor &descr, const TTLLoopAttrs *attrs,
+    bool isTTLFrontendLoop) {
   mlir::Value lb = descr.getLowerBound();
   mlir::Value ub = descr.getUpperBound();
-  buildAffineLoopImpl(fors, loc, lb, ub, descr);
+  buildAffineLoopImpl(fors, loc, lb, ub, descr, attrs, isTTLFrontendLoop);
 }
 
 ValueCategory MLIRScanner::VisitForStmt(clang::ForStmt *fors) {
@@ -217,13 +284,81 @@ ValueCategory MLIRScanner::VisitForStmt(clang::ForStmt *fors) {
   auto loc = getMLIRLocation(fors->getForLoc());
 
   mlirclang::AffineLoopDescriptor affineLoopDescr;
-  if (Glob.scopLocList.isInScop(fors->getForLoc()) &&
-      isTrivialAffineLoop(fors, affineLoopDescr)) {
-    buildAffineLoop(fors, loc, affineLoopDescr);
-  } else {
+  bool isTTLKernel = function->hasAttr("ttl.kernel");
+  bool isTTLFrontendLoop = false;
+  const TTLLoopAttrs *attrs = nullptr;
 
+  if (isTTLKernel) {
+    unsigned macroRank = getTTLLoopRank(fors, Glob.PP);
+    clang::SourceLocation expansionSite =
+        getTTLExpansionSite(Glob.SM, fors->getForLoc());
+
+    if (ttlPendingMultiDimLevels > 0) {
+      if (macroRank != ttlPendingMacroRank ||
+          expansionSite != ttlPendingExpansionSite) {
+        emitTTLLoopError(
+            Glob.PP, fors->getForLoc(),
+            "expected the next physical dimension of the active TTL_LOOP_" +
+                llvm::Twine(ttlPendingMacroRank) + "D expansion");
+      } else {
+        isTTLFrontendLoop = true;
+        --ttlPendingMultiDimLevels;
+        if (ttlPendingMultiDimLevels == 0) {
+          ttlPendingMacroRank = 0;
+          ttlPendingExpansionSite = clang::SourceLocation();
+        }
+      }
+    } else if (macroRank != 0) {
+      isTTLFrontendLoop = true;
+      for (TTLLoopAttrs &candidate : Glob.ttlAnnotations.schedulingQueue) {
+        if (candidate.consumed ||
+            getTTLExpansionSite(Glob.SM, candidate.sourceLocation) !=
+                expansionSite)
+          continue;
+        candidate.consumed = true;
+        attrs = &candidate;
+        break;
+      }
+
+      if (!attrs) {
+        emitTTLLoopError(Glob.PP, fors->getForLoc(),
+                         "TTL_LOOP expansion has no matching scheduling "
+                         "directive");
+      } else if (attrs->tileSizes.size() != macroRank) {
+        emitTTLLoopError(
+            Glob.PP, fors->getForLoc(),
+            "TTL_LOOP_" + llvm::Twine(macroRank) +
+                "D requires exactly " + llvm::Twine(macroRank) +
+                " tile sizes");
+      }
+
+      if (macroRank > 1) {
+        ttlPendingMultiDimLevels = macroRank - 1;
+        ttlPendingMacroRank = macroRank;
+        ttlPendingExpansionSite = expansionSite;
+      }
+    } else {
+      emitTTLLoopError(
+          Glob.PP, fors->getForLoc(),
+          "all loops in a TTL kernel must be written with "
+          "TTL_LOOP_1D/2D/3D");
+    }
+  }
+
+  bool requestAffine =
+      isTTLFrontendLoop || Glob.scopLocList.isInScop(fors->getForLoc());
+  bool isAffine = requestAffine && isTrivialAffineLoop(fors, affineLoopDescr);
+  if (isTTLFrontendLoop && !isAffine)
+    emitTTLLoopError(
+        Glob.PP, fors->getForLoc(),
+        "loop bounds and unit step must lower directly to affine.for");
+
+  if (isAffine) {
+    buildAffineLoop(fors, loc, affineLoopDescr, attrs, isTTLFrontendLoop);
+  } else {
+    //assert(false && "Not a trivial affine loop");
     if (auto *s = fors->getInit()) {
-      Visit(s);
+        Visit(s);
     }
 
     auto i1Ty = builder.getIntegerType(1);

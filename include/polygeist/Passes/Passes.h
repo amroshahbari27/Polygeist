@@ -80,6 +80,8 @@ void registerGpuSerializeToCubinPass();
 void registerGpuSerializeToHsacoPass();
 
 void populateForBreakToWhilePatterns(RewritePatternSet &patterns);
+
+std::unique_ptr<Pass> createStripPolygeistAttrsPass();
 } // namespace polygeist
 } // namespace mlir
 

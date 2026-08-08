@@ -67,6 +67,7 @@ struct MLIRASTConsumer : public ASTConsumer {
   CodeGen::CodeGenModule CGM;
   bool error;
   ScopLocList scopLocList;
+  TTLAnnotationList ttlAnnotations;
   LowerToInfo LTInfo;
 
   /// The stateful type translator (contains named structs).
@@ -96,6 +97,7 @@ struct MLIRASTConsumer : public ASTConsumer {
     addPragmaScopHandlers(PP, scopLocList);
     addPragmaEndScopHandlers(PP, scopLocList);
     addPragmaLowerToHandlers(PP, LTInfo);
+    addPragmaTTLHandlers(PP, ttlAnnotations);
   }
 
   ~MLIRASTConsumer() {}
@@ -156,6 +158,14 @@ private:
   std::vector<LoopContext> loops;
   mlir::Block *allocationScope;
 
+  // Per-function state for the remaining physical dimensions of one
+  // TTL_LOOP_2D/3D expansion. Keeping this on the scanner prevents a malformed
+  // or skipped function from affecting the next function in the translation
+  // unit.
+  unsigned ttlPendingMultiDimLevels = 0;
+  unsigned ttlPendingMacroRank = 0;
+  clang::SourceLocation ttlPendingExpansionSite;
+
   std::map<const void *, std::vector<mlir::LLVM::AllocaOp>> bufs;
   mlir::LLVM::AllocaOp allocateBuffer(size_t i, mlir::LLVM::LLVMPointerType t) {
     auto &vec = bufs[t.getAsOpaquePointer()];
@@ -210,11 +220,14 @@ private:
                        mlirclang::AffineLoopDescriptor &descr);
 
   void buildAffineLoop(clang::ForStmt *fors, mlir::Location loc,
-                       const mlirclang::AffineLoopDescriptor &descr);
+                       const mlirclang::AffineLoopDescriptor &descr,
+                       const TTLLoopAttrs *attrs, bool isTTLFrontendLoop);
 
   void buildAffineLoopImpl(clang::ForStmt *fors, mlir::Location loc,
                            mlir::Value lb, mlir::Value ub,
-                           const mlirclang::AffineLoopDescriptor &descr);
+                           const mlirclang::AffineLoopDescriptor &descr,
+                           const TTLLoopAttrs *attrs,
+                           bool isTTLFrontendLoop);
 
 public:
   const FunctionDecl *EmittingFunctionDecl;

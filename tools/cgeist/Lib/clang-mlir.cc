@@ -16,6 +16,7 @@
 #include "utils.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/FileSystemOptions.h"
@@ -36,8 +37,11 @@
 #include "clang/Parse/Parser.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Sema/SemaDiagnostic.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 
 using namespace std;
 using namespace clang;
@@ -66,6 +70,341 @@ cl::opt<bool> CStyleMemRef("c-style-memref", cl::init(true),
 static cl::opt<bool>
     CombinedStructABI("struct-abi", cl::init(true),
                       cl::desc("Use literal LLVM ABI for structs"));
+
+static unsigned getTTLTensorDeclaratorRank(const ParmVarDecl *parameter,
+                                           Preprocessor &preprocessor) {
+  static const StringRef tensorMacros[] = {
+      "TTL_TENSOR_1D", "TTL_TENSOR_2D", "TTL_TENSOR_3D"};
+  StringRef macroName = findProjectTTLMacroExpansion(
+      preprocessor, parameter->getLocation(), tensorMacros);
+  if (macroName == "TTL_TENSOR_1D")
+    return 1;
+  if (macroName == "TTL_TENSOR_2D")
+    return 2;
+  if (macroName == "TTL_TENSOR_3D")
+    return 3;
+  return 0;
+}
+
+static unsigned getTTLAccessorRank(Preprocessor &preprocessor,
+                                   SourceLocation location) {
+  static const StringRef accessorMacros[] = {
+      "TTL_1D_AR", "TTL_2D_AR", "TTL_3D_AR",
+      "TTL_1D_ID", "TTL_2D_ID", "TTL_3D_ID"};
+  StringRef macroName = findProjectTTLMacroExpansion(
+      preprocessor, location, accessorMacros);
+  if (macroName == "TTL_1D_AR" || macroName == "TTL_1D_ID")
+    return 1;
+  if (macroName == "TTL_2D_AR" || macroName == "TTL_2D_ID")
+    return 2;
+  if (macroName == "TTL_3D_AR" || macroName == "TTL_3D_ID")
+    return 3;
+  return 0;
+}
+
+namespace {
+
+/// Validate source constructs that optimization could otherwise erase before
+/// the MLIR boundary pass sees them.  This is deliberately a syntax contract,
+/// not an optimization analysis: a selected TTL kernel has affine DSL loops
+/// with straight-line bodies, and it cannot become valid merely because a
+/// branch folds or a user helper happens to inline.
+class TTLSourceContractValidator
+    : public RecursiveASTVisitor<TTLSourceContractValidator> {
+public:
+  TTLSourceContractValidator(Preprocessor &preprocessor,
+                             SourceManager &sourceManager,
+                             ASTContext &astContext)
+      : preprocessor(preprocessor), sourceManager(sourceManager),
+        astContext(astContext) {}
+
+  bool validate(const FunctionDecl *function) {
+    if (!function || !function->getBody())
+      return true;
+    for (const ParmVarDecl *parameter : function->parameters()) {
+      if (getTTLTensorDeclaratorRank(parameter, preprocessor) == 0)
+        continue;
+      QualType elementType = parameter->getType();
+      if (elementType->isPointerType())
+        elementType = elementType->getPointeeType();
+      elementType = astContext.getBaseElementType(elementType);
+      if (elementType.getAddressSpace() == LangAS::opencl_global)
+        continue;
+
+      StringRef tensorName = parameter->getName();
+      tensorName.consume_front("_ttl_");
+      unsigned id = preprocessor.getDiagnostics().getCustomDiagID(
+          DiagnosticsEngine::Error, "TTL tensor declaration: %0");
+      preprocessor.Diag(parameter->getLocation(), id)
+          << (Twine("tensor parameter '") + tensorName +
+              "' must use TTL_global(type); local tensors are created only "
+              "by the selected promotion path")
+                 .str();
+      valid = false;
+    }
+    if (!valid)
+      return false;
+    return TraverseStmt(const_cast<Stmt *>(function->getBody())) && valid;
+  }
+
+  bool VisitIfStmt(IfStmt *statement) {
+    return rejectControlFlow(statement->getIfLoc(), "if");
+  }
+
+  bool VisitWhileStmt(WhileStmt *statement) {
+    return rejectControlFlow(statement->getWhileLoc(), "while");
+  }
+
+  bool VisitDoStmt(DoStmt *statement) {
+    return rejectControlFlow(statement->getDoLoc(), "do/while");
+  }
+
+  bool VisitSwitchStmt(SwitchStmt *statement) {
+    return rejectControlFlow(statement->getSwitchLoc(), "switch");
+  }
+
+  bool VisitConditionalOperator(ConditionalOperator *expression) {
+    return rejectControlFlow(expression->getQuestionLoc(),
+                             "conditional operator");
+  }
+
+  bool VisitReturnStmt(ReturnStmt *statement) {
+    return rejectControlFlow(statement->getReturnLoc(), "return");
+  }
+
+  bool VisitCXXForRangeStmt(CXXForRangeStmt *statement) {
+    return rejectControlFlow(statement->getForLoc(), "range-for");
+  }
+
+  bool VisitBreakStmt(BreakStmt *statement) {
+    return rejectControlFlow(statement->getBreakLoc(), "break");
+  }
+
+  bool VisitContinueStmt(ContinueStmt *statement) {
+    return rejectControlFlow(statement->getContinueLoc(), "continue");
+  }
+
+  bool VisitGotoStmt(GotoStmt *statement) {
+    return rejectControlFlow(statement->getGotoLoc(), "goto");
+  }
+
+  bool VisitIndirectGotoStmt(IndirectGotoStmt *statement) {
+    return rejectControlFlow(statement->getGotoLoc(), "indirect goto");
+  }
+
+  bool VisitBinaryOperator(clang::BinaryOperator *expression) {
+    bool pointerOperand = expression->getLHS()->getType()->isPointerType() ||
+                          expression->getRHS()->getType()->isPointerType();
+    if (pointerOperand &&
+        (expression->getOpcode() == clang::BO_Add ||
+         expression->getOpcode() == clang::BO_Sub ||
+         expression->getOpcode() == clang::BO_AddAssign ||
+         expression->getOpcode() == clang::BO_SubAssign))
+      return rejectControlFlow(expression->getOperatorLoc(),
+                               "pointer arithmetic");
+    if (expression->getOpcode() == clang::BO_LAnd ||
+        expression->getOpcode() == clang::BO_LOr) {
+      static const StringRef diagnosticMacros[] = {
+          "_TTL_CHECK_DIAG2_SCALED"};
+      if (isProjectTTLDefinitionSpelling(preprocessor,
+                                         expression->getOperatorLoc()) &&
+          !findProjectTTLMacroExpansion(preprocessor,
+                                        expression->getOperatorLoc(),
+                                        diagnosticMacros)
+               .empty())
+        return true;
+      return rejectControlFlow(expression->getOperatorLoc(),
+                               "short-circuit expression");
+    }
+    return true;
+  }
+
+  bool VisitUnaryOperator(clang::UnaryOperator *expression) {
+    if (expression->getOpcode() == clang::UO_Deref ||
+        expression->getOpcode() == clang::UO_AddrOf ||
+        ((expression->isIncrementDecrementOp()) &&
+         expression->getSubExpr()->getType()->isPointerType()))
+      return rejectControlFlow(expression->getOperatorLoc(),
+                               "pointer manipulation");
+    return true;
+  }
+
+  bool VisitVarDecl(VarDecl *declaration) {
+    if (!declaration->isLocalVarDecl() ||
+        !declaration->getType()->isPointerType())
+      return true;
+    unsigned id = preprocessor.getDiagnostics().getCustomDiagID(
+        DiagnosticsEngine::Error, "TTL frontend: %0");
+    preprocessor.Diag(declaration->getLocation(), id)
+        << (Twine("local pointer alias '") + declaration->getName() +
+            "' is unsupported; access tensor parameters directly with the "
+            "pinned TTL_1D/2D/3D_ID or TTL_1D/2D/3D_AR macro")
+               .str();
+    valid = false;
+    return false;
+  }
+
+  bool VisitCallExpr(CallExpr *expression) {
+    const FunctionDecl *callee = expression->getDirectCallee();
+    if (callee && callee->getBuiltinID() != 0)
+      return true;
+    if (isTrustedTTLAccessorHelper(expression, callee))
+      return true;
+
+    StringRef name = callee ? callee->getName() : StringRef();
+    unsigned id = preprocessor.getDiagnostics().getCustomDiagID(
+        DiagnosticsEngine::Error, "TTL frontend: %0");
+    preprocessor.Diag(expression->getExprLoc(), id)
+        << (name.empty()
+                ? Twine("indirect helper calls are unsupported; write the "
+                        "affine expression directly in the TTL_LOOP body")
+                      .str()
+                : (Twine("ordinary user helper call '") + name +
+                   "' is unsupported; write its affine expression directly "
+                   "in the TTL_LOOP body")
+                      .str());
+    valid = false;
+    return false;
+  }
+
+private:
+  bool isTrustedTTLAccessorHelper(const CallExpr *expression,
+                                  const FunctionDecl *callee) const {
+    if (!callee)
+      return false;
+    StringRef helper = callee->getName();
+    if (helper != "_ttl_affine_idx" && helper != "_ttl_streq" &&
+        helper != "_ttl_check_constant_scale" &&
+        helper != "_ttl_check_constant_offset")
+      return false;
+
+    static const StringRef accessorMacros[] = {
+        "TTL_1D_AR", "TTL_2D_AR", "TTL_3D_AR",
+        "TTL_1D_ID", "TTL_2D_ID", "TTL_3D_ID"};
+    return !findProjectTTLMacroExpansion(
+                preprocessor, expression->getExprLoc(), accessorMacros)
+                .empty();
+  }
+
+  bool rejectControlFlow(SourceLocation location, StringRef construct) {
+    unsigned id = preprocessor.getDiagnostics().getCustomDiagID(
+        DiagnosticsEngine::Error, "TTL frontend: %0");
+    preprocessor.Diag(sourceManager.getExpansionLoc(location), id)
+        << (Twine("unsupported control/data operation '") + construct +
+            "'; use affine loops and accesses: express iteration with "
+            "TTL_LOOP_1D/2D/3D and keep each loop body branch-free")
+               .str();
+    valid = false;
+    return false;
+  }
+
+  Preprocessor &preprocessor;
+  SourceManager &sourceManager;
+  ASTContext &astContext;
+  bool valid = true;
+};
+
+class TTLIndexReferenceCollector
+    : public RecursiveASTVisitor<TTLIndexReferenceCollector> {
+public:
+  bool VisitDeclRefExpr(DeclRefExpr *reference) {
+    if (auto *variable = dyn_cast<VarDecl>(reference->getDecl()))
+      variables.insert(variable);
+    return true;
+  }
+
+  SmallPtrSet<const VarDecl *, 4> variables;
+};
+
+} // namespace
+
+static const ParmVarDecl *getArrayBaseParameter(const Expr *expression) {
+  const Expr *current = expression;
+  while (current) {
+    current = current->IgnoreParenImpCasts();
+    if (auto subscript = dyn_cast<ArraySubscriptExpr>(current)) {
+      current = subscript->getBase();
+      continue;
+    }
+    if (auto reference = dyn_cast<DeclRefExpr>(current))
+      return dyn_cast<ParmVarDecl>(reference->getDecl());
+    return nullptr;
+  }
+  return nullptr;
+}
+
+static void validateTTLTensorAccess(const ArraySubscriptExpr *expression,
+                                    Preprocessor &preprocessor,
+                                    ASTContext &astContext) {
+  if (astContext.getAsArrayType(expression->getType()))
+    return;
+  const ParmVarDecl *parameter = getArrayBaseParameter(expression);
+  if (!parameter)
+    return;
+  unsigned tensorRank =
+      getTTLTensorDeclaratorRank(parameter, preprocessor);
+  if (tensorRank == 0)
+    return;
+  unsigned accessorRank =
+      getTTLAccessorRank(preprocessor, expression->getExprLoc());
+  StringRef tensorName = parameter->getName();
+  tensorName.consume_front("_ttl_");
+  unsigned id = preprocessor.getDiagnostics().getCustomDiagID(
+      DiagnosticsEngine::Error, "TTL tensor access: %0");
+  if (accessorRank == tensorRank) {
+    SmallVector<const Expr *> axes;
+    const Expr *current = expression;
+    while (auto *subscript =
+               dyn_cast<ArraySubscriptExpr>(current->IgnoreParenImpCasts())) {
+      axes.push_back(subscript->getIdx());
+      current = subscript->getBase();
+    }
+    std::reverse(axes.begin(), axes.end());
+
+    static const StringRef loopMacros[] = {
+        "TTL_LOOP_1D", "TTL_LOOP_2D", "TTL_LOOP_3D"};
+    SmallPtrSet<const VarDecl *, 4> usedAxes;
+    for (auto [axis, index] : llvm::enumerate(axes)) {
+      TTLIndexReferenceCollector collector;
+      collector.TraverseStmt(const_cast<Expr *>(index));
+      if (collector.variables.size() != 1) {
+        preprocessor.Diag(index->getExprLoc(), id)
+            << (Twine("axis ") + Twine(static_cast<unsigned>(axis)) +
+                " of tensor '" + tensorName +
+                "' must use exactly one TTL_LOOP induction variable")
+                   .str();
+        return;
+      }
+      const VarDecl *variable = *collector.variables.begin();
+      if (findProjectTTLMacroExpansion(preprocessor, variable->getLocation(),
+                                       loopMacros)
+              .empty() ||
+          !isProjectTTLDefinitionSpelling(preprocessor,
+                                          variable->getBeginLoc())) {
+        preprocessor.Diag(index->getExprLoc(), id)
+            << (Twine("index '") + variable->getName() + "' for tensor '" +
+                tensorName +
+                "' was not declared by a pinned TTL_LOOP_1D/2D/3D macro")
+                   .str();
+        return;
+      }
+      if (!usedAxes.insert(variable).second) {
+        preprocessor.Diag(index->getExprLoc(), id)
+            << (Twine("tensor '") + tensorName +
+                "' reuses one TTL_LOOP induction variable on multiple axes")
+                   .str();
+        return;
+      }
+    }
+    return;
+  }
+
+  preprocessor.Diag(expression->getExprLoc(), id)
+      << (Twine("tensor parameter '") + tensorName +
+          "' must be accessed with the pinned TTL_" + Twine(tensorRank) +
+          "D_ID or TTL_" + Twine(tensorRank) + "D_AR macro")
+             .str();
+}
 
 ValueCategory MLIRScanner::createComplexFloat(mlir::Location loc,
                                               mlir::Value real,
@@ -453,6 +792,15 @@ void MLIRScanner::init(mlir::func::FuncOp function, const FunctionDecl *fd) {
       stmt->dump();
     }
     Visit(stmt);
+
+    if (function->hasAttr("ttl.kernel") && ttlPendingMultiDimLevels != 0) {
+      unsigned id = Glob.PP.getDiagnostics().getCustomDiagID(
+          clang::DiagnosticsEngine::Error, "TTL structured loop: %0");
+      Glob.PP.Diag(stmt->getEndLoc(), id)
+          << ("TTL_LOOP_" + llvm::Twine(ttlPendingMacroRank) +
+              "D did not produce all of its physical loop dimensions")
+                 .str();
+    }
 
     loc = getMLIRLocation(stmt->getEndLoc());
   } else {
@@ -1729,6 +2077,9 @@ ValueCategory MLIRScanner::CommonArrayLookup(mlir::Location loc,
 
 ValueCategory
 MLIRScanner::VisitArraySubscriptExpr(clang::ArraySubscriptExpr *expr) {
+  if (function && function->hasAttr("ttl.kernel"))
+    validateTTLTensorAccess(expr, Glob.PP, Glob.astContext);
+
   auto loc = getMLIRLocation(expr->getExprLoc());
   auto moo = Visit(expr->getLHS());
 
@@ -5184,6 +5535,66 @@ MLIRASTConsumer::GetOrCreateMLIRFunction(const FunctionDecl *FD,
   mlir::func::FuncOp function = mlir::func::FuncOp(mlir::func::FuncOp::create(
       getMLIRLocation(FD->getLocation()), name, funcType));
 
+  // OpenCL __kernel: treat as TTL kernel entry point. Infer ttl.readonly and
+  // ttl.argname from the source parameters. ttl.frontend_tensor is temporary
+  // provenance for a parameter declared through TTL_TENSOR_* and is removed
+  // by the frontend boundary pass.
+  if (FD->hasAttr<OpenCLKernelAttr>()) {
+    function->setAttr("ttl.kernel", builder.getUnitAttr());
+    auto fTy = function.getFunctionType();
+    for (unsigned i = 0; i < fTy.getNumInputs(); ++i) {
+      const clang::ParmVarDecl *P =
+          i < FD->getNumParams() ? FD->getParamDecl(i) : nullptr;
+      if (!isa<MemRefType>(fTy.getInput(i))) {
+        if (P) {
+          unsigned id = PP.getDiagnostics().getCustomDiagID(
+              DiagnosticsEngine::Error, "TTL kernel argument: %0");
+          PP.Diag(P->getLocation(), id)
+              << (Twine("parameter '") + P->getName() +
+                  "' must be a static rank-1/2/3 memref declared with "
+                  "TTL_TENSOR_1D/2D/3D")
+                     .str();
+        }
+        continue;
+      }
+      if (P) {
+        StringRef argName = P->getName();
+        bool hasTTLTensorName = argName.consume_front("_ttl_");
+        unsigned tensorRank = getTTLTensorDeclaratorRank(P, PP);
+        unsigned memrefRank = cast<MemRefType>(fTy.getInput(i)).getRank();
+        bool ranksMatch = tensorRank != 0 && tensorRank == memrefRank;
+        bool isStructuredTensor = hasTTLTensorName && ranksMatch;
+        function.setArgAttr(i, "ttl.argname",
+                            builder.getStringAttr(argName));
+        if (isStructuredTensor)
+          function.setArgAttr(i, "ttl.frontend_tensor", builder.getUnitAttr());
+        else {
+          unsigned id = PP.getDiagnostics().getCustomDiagID(
+              DiagnosticsEngine::Error, "TTL tensor declaration: %0");
+          if (tensorRank != 0 && tensorRank != memrefRank)
+            PP.Diag(P->getLocation(), id)
+                << (Twine("TTL_TENSOR_") + Twine(tensorRank) +
+                    "D declarator for parameter '" + argName +
+                    "' lowered to rank " + Twine(memrefRank) +
+                    "; expected rank " + Twine(tensorRank))
+                       .str();
+          else
+            PP.Diag(P->getLocation(), id)
+                << (Twine("tensor parameter '") + argName +
+                    "' must use the pinned TTL_TENSOR_1D/2D/3D declarator")
+                       .str();
+        }
+        clang::QualType pt = P->getType();
+        if (pt->isPointerType())
+          pt = pt->getPointeeType();
+        else if (pt->isArrayType())
+          pt = clang::QualType(pt->getBaseElementTypeUnsafe(), 0);
+        if (pt.isConstQualified())
+          function.setArgAttr(i, "ttl.readonly", builder.getUnitAttr());
+      }
+    }
+  }
+
   if ((FD->hasAttr<CUDAGlobalAttr>() || FD->hasAttr<CUDADeviceAttr>()) &&
       !FD->hasAttr<CUDAHostAttr>()) {
     function->setAttr("polygeist.device_only_func",
@@ -5220,7 +5631,38 @@ MLIRASTConsumer::GetOrCreateMLIRFunction(const FunctionDecl *FD,
   return function;
 }
 
+static bool isWithinFunctionBody(clang::SourceManager &sourceManager,
+                                 clang::SourceLocation location,
+                                 const clang::FunctionDecl *function) {
+  const clang::Stmt *body = function->getBody();
+  if (!body)
+    return false;
+  clang::SourceLocation point = sourceManager.getExpansionLoc(location);
+  clang::SourceLocation begin =
+      sourceManager.getExpansionLoc(body->getBeginLoc());
+  clang::SourceLocation end =
+      sourceManager.getExpansionLoc(body->getEndLoc());
+  auto [pointFile, pointOffset] = sourceManager.getDecomposedLoc(point);
+  auto [beginFile, beginOffset] = sourceManager.getDecomposedLoc(begin);
+  auto [endFile, endOffset] = sourceManager.getDecomposedLoc(end);
+  return pointFile == beginFile && pointFile == endFile &&
+         beginOffset <= pointOffset && pointOffset <= endOffset;
+}
+
 void MLIRASTConsumer::run() {
+  // Check every selected TTL entry point before lowering any function.  In
+  // particular, do this before a queued helper definition can be lowered and
+  // before canonicalization/inlining could erase the source construct that the
+  // contract must reject.
+  for (const FunctionDecl *function : functionsToEmit) {
+    if (!function->hasAttr<OpenCLKernelAttr>())
+      continue;
+    TTLSourceContractValidator validator(PP, SM, astContext);
+    if (!validator.validate(function))
+      return;
+  }
+
+  SmallVector<const FunctionDecl *> selectedTTLKernels;
   while (functionsToEmit.size()) {
     const FunctionDecl *FD = functionsToEmit.front();
     functionsToEmit.pop_front();
@@ -5241,8 +5683,24 @@ void MLIRASTConsumer::run() {
     if (done.count(name))
       continue;
     done.insert(name);
+    if (FD->hasAttr<OpenCLKernelAttr>())
+      selectedTTLKernels.push_back(FD);
     MLIRScanner ms(*this, module, LTInfo);
     ms.init(GetOrCreateMLIRFunction(FD), FD);
+  }
+
+  for (const TTLLoopAttrs &attrs : ttlAnnotations.schedulingQueue) {
+    if (attrs.consumed)
+      continue;
+    if (!llvm::any_of(selectedTTLKernels, [&](const FunctionDecl *function) {
+          return isWithinFunctionBody(SM, attrs.sourceLocation, function);
+        }))
+      continue;
+    unsigned id = PP.getDiagnostics().getCustomDiagID(
+        clang::DiagnosticsEngine::Error, "TTL structured loop: %0");
+    PP.Diag(attrs.sourceLocation, id)
+        << "scheduling directive was not consumed by a matching TTL_LOOP in "
+           "the selected __kernel";
   }
 }
 
@@ -5397,7 +5855,15 @@ bool MLIRASTConsumer::HandleTopLevelDecl(DeclGroupRef dg) {
 
 // Wait until Sema has instantiated all the relevant code
 // before running codegen on the selected functions.
-void MLIRASTConsumer::HandleTranslationUnit(ASTContext &C) { run(); }
+void MLIRASTConsumer::HandleTranslationUnit(ASTContext &C) {
+  // Do not lower Clang recovery expressions after source validation has
+  // already diagnosed an invalid TTL program.  Continuing here can turn an
+  // actionable source error into a later assertion or signal in MLIR
+  // construction; the driver will report the ordinary diagnostic failure.
+  if (PP.getDiagnostics().hasErrorOccurred())
+    return;
+  run();
+}
 
 mlir::Location MLIRASTConsumer::getMLIRLocation(clang::SourceLocation loc) {
   auto spellingLoc = SM.getSpellingLoc(loc);

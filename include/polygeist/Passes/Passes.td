@@ -201,6 +201,15 @@ def OpenMPOptPass : Pass<"openmp-opt"> {
   ];
 }
 
+def StripPolygeistAttrsPass : Pass<"strip-polygeist-attrs", "mlir::ModuleOp"> {
+  let summary = "Strip Polygeist and LLVM attributes from the module";
+  let constructor = "mlir::polygeist::createStripPolygeistAttrsPass()";
+  let dependentDialects = [
+    "func::FuncDialect",
+    "LLVM::LLVMDialect"
+  ];
+}
+
 def PolygeistCanonicalize : Pass<"canonicalize-polygeist"> {
   let constructor = "mlir::polygeist::createPolygeistCanonicalizePass()";
   let dependentDialects = [
